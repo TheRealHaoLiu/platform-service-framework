@@ -44,26 +44,51 @@ def _load_direct_url() -> dict[str, Any] | None:
         return None
 
 
-def _normalize_repo_url(url: str) -> str:
-    """Convert file:// URLs to local paths for copier compatibility."""
+def _parse_git_url(url: str) -> tuple[str, str | None]:
+    """Parse git URL into (src_path, vcs_ref).
+
+    Strips git+ prefix and extracts @ref if present.
+    Converts file:// URLs to local paths.
+    """
+    # Strip git+ prefix
+    if url.startswith("git+"):
+        url = url[4:]
+
+    # Convert file:// URLs to local paths
     parsed = urlparse(url)
     if parsed.scheme == "file":
-        return Path(unquote(parsed.path)).resolve().as_posix()
-    return url
+        url = Path(unquote(parsed.path)).resolve().as_posix()
+
+    # Extract @ref
+    if "@" in url and "://" in url:
+        # Only split on @ if it comes after ://
+        scheme_end = url.index("://") + 3
+        path_part = url[scheme_end:]
+        if "@" in path_part:
+            base_url = url[:scheme_end] + path_part.split("@")[0]
+            vcs_ref = path_part.split("@", 1)[1]
+            return base_url, vcs_ref
+
+    return url, None
 
 
-def _repo_from_direct_url(data: dict[str, Any]) -> str | None:
+def _repo_from_direct_url(data: dict[str, Any]) -> tuple[str, str | None] | None:
+    """Extract repository source and vcs_ref from direct_url.json."""
     url = data.get("url")
     if not isinstance(url, str):
         return None
 
-    repo_url = _normalize_repo_url(url)
+    src_path, vcs_ref = _parse_git_url(url)
+
+    # Override with vcs_info if available
     vcs_info = data.get("vcs_info")
     if isinstance(vcs_info, dict):
+        # requested_revision is what user specified, commit_id is what was resolved
         revision = vcs_info.get("requested_revision") or vcs_info.get("commit_id")
-        if revision and "@" not in repo_url:
-            return f"{repo_url}@{revision}"
-    return repo_url
+        if revision:
+            vcs_ref = revision
+
+    return src_path, vcs_ref
 
 
 def _repo_from_git(path: Path) -> str | None:
@@ -74,57 +99,68 @@ def _repo_from_git(path: Path) -> str | None:
     return repo.working_tree_dir
 
 
-def resolve_framework_repo(source_override: str | None = None) -> tuple[str, list[str]]:
-    """Resolve repository/branch with trace information."""
+def resolve_framework_repo(
+    source_override: str | None = None,
+) -> tuple[str, str | None, list[str]]:
+    """Resolve repository source and vcs_ref with trace information.
+
+    Returns:
+        (src_path, vcs_ref, trace) where:
+        - src_path: Repository URL or local path
+        - vcs_ref: Git reference (branch/tag/commit) or None
+        - trace: List of resolution steps
+    """
     trace: list[str] = []
 
     if source_override:
-        repo = _normalize_repo_url(source_override)
-        trace.append(f"--from override provided: {repo}")
-        return repo, trace
+        src_path, vcs_ref = _parse_git_url(source_override)
+        trace.append(f"--from override provided: {src_path} (ref={vcs_ref})")
+        return src_path, vcs_ref, trace
 
     env_repo = os.getenv("FRAMEWORK_REPO")
     if env_repo:
-        repo = _normalize_repo_url(env_repo)
-        trace.append(f"FRAMEWORK_REPO environment set: {repo}")
-        return repo, trace
+        src_path, vcs_ref = _parse_git_url(env_repo)
+        trace.append(f"FRAMEWORK_REPO environment set: {src_path} (ref={vcs_ref})")
+        return src_path, vcs_ref, trace
     trace.append("FRAMEWORK_REPO environment not set")
 
     direct_url = _load_direct_url()
     if direct_url:
-        repo_url = _repo_from_direct_url(direct_url)
-        vcs_info = direct_url.get("vcs_info") if isinstance(direct_url, dict) else None
-        revision = None
-        if isinstance(vcs_info, dict):
-            revision = vcs_info.get("requested_revision") or vcs_info.get("commit_id")
-        trace.append(
-            f"direct_url.json found: url={direct_url.get('url')} revision={revision} "
-            f"resolved={repo_url}"
-        )
-        if repo_url:
-            return repo_url, trace
+        result = _repo_from_direct_url(direct_url)
+        if result:
+            src_path, vcs_ref = result
+            trace.append(
+                f"direct_url.json found: url={direct_url.get('url')} "
+                f"resolved=({src_path}, ref={vcs_ref})"
+            )
+            return src_path, vcs_ref, trace
     else:
         trace.append("direct_url.json not found")
 
     git_repo = _repo_from_git(Path(__file__).resolve())
     if git_repo:
         trace.append(f"Local git repository detected: {git_repo}")
-        return git_repo, trace
+        return git_repo, None, trace
     trace.append("Local git repository not detected")
 
     trace.append(f"Falling back to default repository: {DEFAULT_REPO}")
-    return DEFAULT_REPO, trace
+    return DEFAULT_REPO, None, trace
 
 
-def detect_framework_repo() -> str:
-    repo, trace = resolve_framework_repo()
+def detect_framework_repo() -> tuple[str, str | None]:
+    """Detect framework repository source and vcs_ref.
+
+    Returns:
+        (src_path, vcs_ref) tuple
+    """
+    src_path, vcs_ref, trace = resolve_framework_repo()
     for line in trace:
         _debug(line)
-    _debug(f"Framework templates source resolved to: {repo}")
-    return repo
+    _debug(f"Framework templates source resolved to: {src_path} (ref={vcs_ref})")
+    return src_path, vcs_ref
 
 
-REPO = detect_framework_repo()
+REPO, VCS_REF = detect_framework_repo()
 
 
 @app.command
@@ -162,6 +198,7 @@ def init(
     run_copy(
         REPO,
         destination,
+        vcs_ref=VCS_REF,
         data={
             "project_name": project,
             "template": "templates/project",
@@ -174,6 +211,7 @@ def init(
         run_copy(
             REPO,
             apps_destination / app_name,
+            vcs_ref=VCS_REF,
             data={
                 "template": "templates/app",
             },
@@ -196,11 +234,12 @@ def debug(
     from_: Annotated[str | None, Parameter(name="--from")] = None,
 ):
     """Show how the framework source is resolved."""
-    repo, trace = resolve_framework_repo(from_)
+    src_path, vcs_ref, trace = resolve_framework_repo(from_)
     print("Framework repository resolution:")
     for line in trace:
         print(f"- {line}")
-    print(f"=> Selected source: {repo}")
+    print(f"=> Selected source: {src_path}")
+    print(f"=> VCS reference: {vcs_ref or 'HEAD (default branch)'}")
 
 
 @app.command
